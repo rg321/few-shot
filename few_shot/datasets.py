@@ -177,7 +177,7 @@ class MiniImageNet(Dataset):
 
 
 class DummyDataset(Dataset):
-    def __init__(self, samples_per_class=10, n_classes=10, n_features=1):
+    def __init__(self, subset, samples_per_class=10, n_classes=10, n_features=1):
         """Dummy dataset for debugging/testing purposes
 
         A sample from the DummyDataset has (n_features + 1) features. The first feature is the index of the sample
