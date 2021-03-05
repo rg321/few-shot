@@ -1,206 +1,135 @@
-from torch.utils.data import Dataset
-import torch
-from PIL import Image
-from torchvision import transforms
-from skimage import io
-from tqdm import tqdm
-import pandas as pd
-import numpy as np
-import os
+"""
+Reproduce Omniglot results of Snell et al Prototypical networks.
+"""
+from torch.optim import Adam
+from torch.utils.data import DataLoader
+import argparse
 
-from config import DATA_PATH
-
-
-class OmniglotDataset(Dataset):
-    def __init__(self, subset):
-        """Dataset class representing Omniglot dataset
-
-        # Arguments:
-            subset: Whether the dataset represents the background or evaluation set
-        """
-        if subset not in ('background', 'evaluation'):
-            raise(ValueError, 'subset must be one of (background, evaluation)')
-        self.subset = subset
-
-        self.df = pd.DataFrame(self.index_subset(self.subset))
-
-        # Index of dataframe has direct correspondence to item in dataset
-        self.df = self.df.assign(id=self.df.index.values)
-
-        # Convert arbitrary class names of dataset to ordered 0-(num_speakers - 1) integers
-        self.unique_characters = sorted(self.df['class_name'].unique())
-        self.class_name_to_id = {self.unique_characters[i]: i for i in range(self.num_classes())}
-        self.df = self.df.assign(class_id=self.df['class_name'].apply(lambda c: self.class_name_to_id[c]))
-
-        # Create dicts
-        self.datasetid_to_filepath = self.df.to_dict()['filepath']
-        self.datasetid_to_class_id = self.df.to_dict()['class_id']
-
-    def __getitem__(self, item):
-        instance = io.imread(self.datasetid_to_filepath[item])
-        # Reindex to channels first format as supported by pytorch
-        instance = instance[np.newaxis, :, :]
-
-        # Normalise to 0-1
-        instance = (instance - instance.min()) / (instance.max() - instance.min())
-
-        label = self.datasetid_to_class_id[item]
-
-        return torch.from_numpy(instance), label
-
-    def __len__(self):
-        return len(self.df)
-
-    def num_classes(self):
-        return len(self.df['class_name'].unique())
-
-    @staticmethod
-    def index_subset(subset):
-        """Index a subset by looping through all of its files and recording relevant information.
-
-        # Arguments
-            subset: Name of the subset
-
-        # Returns
-            A list of dicts containing information about all the image files in a particular subset of the
-            Omniglot dataset dataset
-        """
-        images = []
-        print('Indexing {}...'.format(subset))
-        # Quick first pass to find total for tqdm bar
-        subset_len = 0
-        for root, folders, files in os.walk(DATA_PATH + '/Omniglot/images_{}/'.format(subset)):
-            subset_len += len([f for f in files if f.endswith('.png')])
-
-        progress_bar = tqdm(total=subset_len)
-        for root, folders, files in os.walk(DATA_PATH + '/Omniglot/images_{}/'.format(subset)):
-            if len(files) == 0:
-                continue
-
-            alphabet = root.split('/')[-2]
-            class_name = '{}.{}'.format(alphabet, root.split('/')[-1])
-
-            for f in files:
-                progress_bar.update(1)
-                images.append({
-                    'subset': subset,
-                    'alphabet': alphabet,
-                    'class_name': class_name,
-                    'filepath': os.path.join(root, f)
-                })
-
-        progress_bar.close()
-        return images
+from few_shot.datasets import OmniglotDataset, MiniImageNet, DummyDataset
+from few_shot.models import get_few_shot_encoder
+from few_shot.core import NShotTaskSampler, EvaluateFewShot, prepare_nshot_task
+from few_shot.proto import proto_net_episode
+from few_shot.train import fit
+from few_shot.callbacks import *
+from few_shot.utils import setup_dirs
+from config import PATH
 
 
-class MiniImageNet(Dataset):
-    def __init__(self, subset):
-        """Dataset class representing miniImageNet dataset
-
-        # Arguments:
-            subset: Whether the dataset represents the background or evaluation set
-        """
-        if subset not in ('background', 'evaluation'):
-            raise(ValueError, 'subset must be one of (background, evaluation)')
-        self.subset = subset
-
-        self.df = pd.DataFrame(self.index_subset(self.subset))
-
-        # Index of dataframe has direct correspondence to item in dataset
-        self.df = self.df.assign(id=self.df.index.values)
-
-        # Convert arbitrary class names of dataset to ordered 0-(num_speakers - 1) integers
-        self.unique_characters = sorted(self.df['class_name'].unique())
-        self.class_name_to_id = {self.unique_characters[i]: i for i in range(self.num_classes())}
-        self.df = self.df.assign(class_id=self.df['class_name'].apply(lambda c: self.class_name_to_id[c]))
-
-        # Create dicts
-        self.datasetid_to_filepath = self.df.to_dict()['filepath']
-        self.datasetid_to_class_id = self.df.to_dict()['class_id']
-
-        # Setup transforms
-        self.transform = transforms.Compose([
-            transforms.CenterCrop(224),
-            transforms.Resize(84),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
-
-    def __getitem__(self, item):
-        instance = Image.open(self.datasetid_to_filepath[item])
-        instance = self.transform(instance)
-        label = self.datasetid_to_class_id[item]
-        return instance, label
-
-    def __len__(self):
-        return len(self.df)
-
-    def num_classes(self):
-        return len(self.df['class_name'].unique())
-
-    @staticmethod
-    def index_subset(subset):
-        """Index a subset by looping through all of its files and recording relevant information.
-
-        # Arguments
-            subset: Name of the subset
-
-        # Returns
-            A list of dicts containing information about all the image files in a particular subset of the
-            miniImageNet dataset
-        """
-        images = []
-        print('Indexing {}...'.format(subset))
-        # Quick first pass to find total for tqdm bar
-        subset_len = 0
-        for root, folders, files in os.walk(DATA_PATH + '/miniImageNet/images_{}/'.format(subset)):
-            subset_len += len([f for f in files if f.endswith('.png')])
-
-        progress_bar = tqdm(total=subset_len)
-        for root, folders, files in os.walk(DATA_PATH + '/miniImageNet/images_{}/'.format(subset)):
-            if len(files) == 0:
-                continue
-
-            class_name = root.split('/')[-1]
-
-            for f in files:
-                progress_bar.update(1)
-                images.append({
-                    'subset': subset,
-                    'class_name': class_name,
-                    'filepath': os.path.join(root, f)
-                })
-
-        progress_bar.close()
-        return images
+setup_dirs()
+assert torch.cuda.is_available()
+device = torch.device('cuda')
+torch.backends.cudnn.benchmark = True
 
 
-class DummyDataset(Dataset):
-    def __init__(self, subset, samples_per_class=10, n_classes=10, n_features=1):
-        """Dummy dataset for debugging/testing purposes
+##############
+# Parameters #
+##############
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset')
+parser.add_argument('--distance', default='l2')
+parser.add_argument('--n-train', default=1, type=int)
+parser.add_argument('--n-test', default=1, type=int)
+parser.add_argument('--k-train', default=60, type=int)
+parser.add_argument('--k-test', default=5, type=int)
+parser.add_argument('--q-train', default=5, type=int)
+parser.add_argument('--q-test', default=1, type=int)
+args = parser.parse_args()
 
-        A sample from the DummyDataset has (n_features + 1) features. The first feature is the index of the sample
-        in the data and the remaining features are the class index.
+evaluation_episodes = 1000
+episodes_per_epoch = 100
 
-        # Arguments
-            samples_per_class: Number of samples per class in the dataset
-            n_classes: Number of distinct classes in the dataset
-            n_features: Number of extra features each sample should have.
-        """
-        self.samples_per_class = samples_per_class
-        self.n_classes = n_classes
-        self.n_features = n_features
+if args.dataset == 'omniglot':
+    n_epochs = 40
+    dataset_class = OmniglotDataset
+    num_input_channels = 1
+    drop_lr_every = 20
+elif args.dataset == 'miniImageNet':
+    n_epochs = 80
+    dataset_class = MiniImageNet
+    num_input_channels = 3
+    drop_lr_every = 40DummyDataset
+elif args.dataset == 'few-shot':
+    n_epochs = 10
+    dataset_class = DummyDataset
+    num_input_channels = 3
+    drop_lr_every = 5
+else:
+    raise(ValueError, 'Unsupported dataset')
 
-        # Create a dataframe to be consistent with other Datasets
-        self.df = pd.DataFrame({
-            'class_id': [i % self.n_classes for i in range(len(self))]
-        })
-        self.df = self.df.assign(id=self.df.index.values)
+param_str = f'{args.dataset}_nt={args.n_train}_kt={args.k_train}_qt={args.q_train}_' \
+            f'nv={args.n_test}_kv={args.k_test}_qv={args.q_test}'
 
-    def __len__(self):
-        return self.samples_per_class * self.n_classes
+print(param_str)
 
-    def __getitem__(self, item):
-        class_id = item % self.n_classes
-        return np.array([item] + [class_id]*self.n_features, dtype=np.float), float(class_id)
+###################
+# Create datasets #
+###################
+background = dataset_class('background')
+background_taskloader = DataLoader(
+    background,
+    batch_sampler=NShotTaskSampler(background, episodes_per_epoch, args.n_train, args.k_train, args.q_train),
+    num_workers=4
+)
+evaluation = dataset_class('evaluation')
+evaluation_taskloader = DataLoader(
+    evaluation,
+    batch_sampler=NShotTaskSampler(evaluation, episodes_per_epoch, args.n_test, args.k_test, args.q_test),
+    num_workers=4
+)
+
+
+#########
+# Model #
+#########
+model = get_few_shot_encoder(num_input_channels)
+model.to(device, dtype=torch.double)
+
+
+############
+# Training #
+############
+print(f'Training Prototypical network on {args.dataset}...')
+optimiser = Adam(model.parameters(), lr=1e-3)
+loss_fn = torch.nn.NLLLoss().cuda()
+
+
+def lr_schedule(epoch, lr):
+    # Drop lr every 2000 episodes
+    if epoch % drop_lr_every == 0:
+        return lr / 2
+    else:
+        return lr
+
+
+callbacks = [
+    EvaluateFewShot(
+        eval_fn=proto_net_episode,
+        num_tasks=evaluation_episodes,
+        n_shot=args.n_test,
+        k_way=args.k_test,
+        q_queries=args.q_test,
+        taskloader=evaluation_taskloader,
+        prepare_batch=prepare_nshot_task(args.n_test, args.k_test, args.q_test),
+        distance=args.distance
+    ),
+    ModelCheckpoint(
+        filepath=PATH + f'/models/proto_nets/{param_str}.pth',
+        monitor=f'val_{args.n_test}-shot_{args.k_test}-way_acc'
+    ),
+    LearningRateScheduler(schedule=lr_schedule),
+    CSVLogger(PATH + f'/logs/proto_nets/{param_str}.csv'),
+]
+
+fit(
+    model,
+    optimiser,
+    loss_fn,
+    epochs=n_epochs,
+    dataloader=background_taskloader,
+    prepare_batch=prepare_nshot_task(args.n_train, args.k_train, args.q_train),
+    callbacks=callbacks,
+    metrics=['categorical_accuracy'],
+    fit_function=proto_net_episode,
+    fit_function_kwargs={'n_shot': args.n_train, 'k_way': args.k_train, 'q_queries': args.q_train, 'train': True,
+                         'distance': args.distance},
+)
